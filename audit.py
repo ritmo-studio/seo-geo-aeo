@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""Мини-аудит сайта по чек-листу SEO / AEO / GEO.
+
+    python3 audit.py https://ritmo.studio/
+    python3 audit.py --local ./snapshot/ --out reports
+
+Скрипт собирает факты (fetch.py + parse.py), прогоняет чек-лист (checks.py) и
+кладёт два файла: читаемый .md и машинный .json. Json нужен, чтобы следующий
+прогон сравнивался с предыдущим: «стало на три крита меньше» — единственная
+честная метрика работы, остальное ощущения.
+
+Чего скрипт не делает и не будет: не рендерит JS, не измеряет Core Web Vitals,
+не оценивает качество текста и не знает, по каким запросам страница должна
+находиться. Он ловит дефекты разметки и связей — то, что иначе ищут глазами
+и пропускают.
+"""
+import argparse, datetime, json, os, pathlib, re, sys, urllib.parse
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import fetch, parse, checks
+
+SKIP_EXT = ('.jpg', '.jpeg', '.png', '.webp', '.avif', '.gif', '.ico', '.css', '.js',
+            '.woff', '.woff2', '.ttf', '.mp4', '.webm', '.mp3', '.svg')
+LOCAL_ONLY_SKIP = ('s_robots', 's_sitemap', 's_probes')
+SEV = {'crit': 0, 'warn': 1, 'note': 2}
+SEVNAME = {'crit': 'критично', 'warn': 'важно', 'note': 'мелочь'}
+CATNAME = {'SEO': 'SEO — индексация и выдача', 'AEO': 'AEO — чтобы ответ можно было собрать и процитировать',
+           'GEO': 'GEO — узнаваемость сущности', 'SEM': 'Семантика и доступность', 'TECH': 'Техника'}
+
+
+class Ctx:
+    def __init__(self, start, cfg, local=False, cached=False):
+        self.start, self.cfg, self.local, self.cached = start, cfg, local, cached
+        sp = urllib.parse.urlsplit(start)
+        self.host = sp.netloc
+        self.root = '%s://%s/' % (sp.scheme or 'file', sp.netloc) if sp.netloc else start
+        self.pages, self.link_status, self.link_src = [], {}, {}
+        self.asset_status = {}       # og:image и иконки: проверяем, но это не перелинковка
+        self.sitemap, self.robots, self.probe = {}, {}, {}
+
+    def internal(self, url):
+        if self.local:
+            return url.startswith(self.start)
+        return urllib.parse.urlsplit(url).netloc.lower().lstrip('www.') == self.host.lower().lstrip('www.')
+
+    def is_home(self, url):
+        return url.rstrip('/') in (self.start.rstrip('/'), self.root.rstrip('/'))
+
+    def short(self, url):
+        return url[len(self.start):] or '/' if url.startswith(self.start) else url
+
+    def ignored(self, f):
+        """Правило конфига: 'SEO-THIN' — код целиком, 'SEO-THIN@/blog/' — код на адресах с куском пути.
+        Без этого любой аудит через неделю перестают читать: десять известных и принятых
+        находок прячут одну новую."""
+        for rule in self.cfg.get('ignore', []):
+            code, _, pat = str(rule).partition('@')
+            if code in ('*', f['code']) and (not pat or pat in f['url']):
+                return True
+        return False
+
+    def ok_pages(self):
+        return [p for p in self.pages if not p.err and 200 <= p.status < 300]
+
+
+def norm_url(u):
+    u = urllib.parse.urldefrag((u or '').strip())[0]
+    sp = urllib.parse.urlsplit(u)
+    if not sp.scheme:
+        return ''
+    q = '&'.join(x for x in sp.query.split('&') if x and not x.lower().startswith(('utm_', 'yclid', 'gclid', 'fbclid')))
+    return urllib.parse.urlunsplit((sp.scheme.lower(), sp.netloc.lower(), sp.path or '/', q, ''))
+
+
+def crawlable(u):
+    return bool(u) and not u.lower().split('?')[0].endswith(SKIP_EXT)
+
+
+# ─────────────────────────── сбор страниц ───────────────────────────
+
+def crawl(ctx, f, max_pages, max_depth, with_query, log):
+    queue, seen = [(ctx.start, 0)], {ctx.start}
+    while queue and len(ctx.pages) < max_pages:
+        url, depth = queue.pop(0)
+        if not f.allowed(url):
+            log('  robots.txt запрещает %s — пропускаем' % url)
+            continue
+        r = f.get(url)
+        p = parse.Page(url, r.status, r.body if r.is_html else '', r.headers, r.ms, r.chain, r.err)
+        ctx.pages.append(p)
+        ctx.link_status[url] = r.status
+        log('  [%d] %s %s%s' % (len(ctx.pages), r.status or 'ERR', url, ' — %s' % r.err if r.err else ''))
+        if not r.is_html or not r.ok:
+            continue
+        for u, text, a, href in p.links:
+            if not u:
+                continue
+            u = norm_url(u)
+            if not u or not ctx.internal(u):
+                continue
+            ctx.link_src.setdefault(u, set()).add(url)
+            if u in seen or not crawlable(u):
+                continue
+            if urllib.parse.urlsplit(u).query and not with_query:
+                continue
+            seen.add(u)
+            if depth + 1 <= max_depth and len(seen) <= max_pages * 3:
+                queue.append((u, depth + 1))
+
+
+def check_rest(ctx, f, log):
+    """Ссылки, до которых обход не дошёл, и картинки шеринга — HEAD'ом, по одной."""
+    todo = [u for u in ctx.link_src if u not in ctx.link_status]
+    assets = sorted({a for p in ctx.ok_pages() for a in p.assets() if ctx.internal(a)})
+    for u in todo:
+        ctx.link_status[u] = 200 if (ctx.local and local_exists(ctx, u)) else (404 if ctx.local else f.head(u).status)
+        if not 200 <= ctx.link_status[u] < 300:
+            log('  битая ссылка: %s → %s' % (u, ctx.link_status[u]))
+    for u in assets:
+        if u in ctx.link_status:
+            ctx.asset_status[u] = ctx.link_status[u]
+            continue
+        ctx.asset_status[u] = 200 if (ctx.local and local_exists(ctx, u)) else (404 if ctx.local else f.head(u).status)
+    for p in ctx.ok_pages():
+        for a in sorted(set(p.assets())):
+            st = ctx.asset_status.get(a)
+            if st and not (200 <= st < 300):
+                p._findings.append(checks.F(
+                    'SEO-OG-ASSET-404', 'SEO', 'warn', '%d: %s' % (st, a),
+                    'превью в мессенджерах и во вкладке будет пустым; относительный путь в og:image '
+                    'считается от адреса страницы, а не от корня — это самая частая причина', p.url))
+
+
+def probes(ctx, f, log):
+    ctx.robots = {'status': 0, 'text': ''}
+    r = f.get(urllib.parse.urljoin(ctx.root, '/robots.txt'))
+    ctx.robots = {'status': r.status, 'text': r.body or ''}
+    sm_url = ''
+    m = re.search(r'(?mi)^\s*sitemap\s*:\s*(\S+)', ctx.robots['text'])
+    sm_url = m.group(1) if m else urllib.parse.urljoin(ctx.root, '/sitemap.xml')
+    ctx.sitemap = read_sitemap(f, sm_url, log)
+    rnd = urllib.parse.urljoin(ctx.root, '/zzz-audit-404-probe-%s/' % datetime.date.today().isoformat())
+    ctx.probe['soft404'] = f.get(rnd).status
+    ctx.probe['llms'] = f.get(urllib.parse.urljoin(ctx.root, '/llms.txt')).status
+    if ctx.root.startswith('https://'):
+        r = f.get('http://' + ctx.host + '/')
+        ctx.probe['http_final'] = r.final
+
+
+def read_sitemap(f, url, log, depth=0):
+    r = f.get(url)
+    out = {'status': r.status, 'urls': [], 'err': ''}
+    if not r.ok or not r.body:
+        return out
+    locs = re.findall(r'<loc>\s*([^<\s]+)\s*</loc>', r.body)
+    if '<sitemapindex' in r.body and depth < 1:
+        for child in locs[:5]:
+            out['urls'] += read_sitemap(f, child, log, depth + 1)['urls']
+    else:
+        out['urls'] = [norm_url(u) for u in locs]
+    if not locs:
+        out['err'] = 'нет ни одного <loc>'
+    return out
+
+
+# ─────────────────────────── локальный режим ───────────────────────────
+
+def local_path(ctx, url):
+    rel = url[len(ctx.start):].lstrip('/')
+    base = pathlib.Path(ctx.cfg['_dir'])
+    for cand in (base / rel, base / rel / 'index.html', base / (rel + '.html'), base / (rel.rstrip('/') + '.html')):
+        if cand.is_file():
+            return cand
+    return None
+
+
+def local_exists(ctx, url):
+    return local_path(ctx, url) is not None
+
+
+def crawl_local(ctx, log):
+    base = pathlib.Path(ctx.cfg['_dir'])
+    files = sorted(p for p in base.rglob('*.htm*') if p.is_file())
+    for fp in files:
+        rel = fp.relative_to(base).as_posix()
+        url = ctx.start + re.sub(r'index\.html?$', '', rel)
+        p = parse.Page(url, 200, fp.read_text(encoding='utf-8', errors='replace'), {'content-type': 'text/html'},
+                       0, (), None, src=str(fp))
+        ctx.pages.append(p)
+        ctx.link_status[url] = 200
+        log('  [%d] %s' % (len(ctx.pages), rel))
+    for p in ctx.pages:
+        for u, t, a, href in p.links:
+            u = norm_url(u)
+            if u and ctx.internal(u):
+                ctx.link_src.setdefault(u, set()).add(p.url)
+
+
+# ─────────────────────────── отчёт ───────────────────────────
+
+def run_checks(ctx):
+    for p in ctx.pages:
+        p._findings = getattr(p, '_findings', [])
+        for fn in checks.PAGE:
+            try:
+                p._findings += [x for x in fn(p, ctx) if x]
+            except Exception as e:
+                p._findings.append(checks.F('TOOL-ERR', 'TECH', 'note',
+                                            'проверка %s упала: %s' % (fn.__name__, e), '', p.url))
+
+
+def run_site_checks(ctx):
+    out = []
+    for fn in checks.SITE:
+        if ctx.local and fn.__name__ in LOCAL_ONLY_SKIP:
+            continue
+        try:
+            out += [x for x in fn(ctx) if x]
+        except Exception as e:
+            out.append(checks.F('TOOL-ERR', 'TECH', 'note', 'проверка %s упала: %s' % (fn.__name__, e), '', ctx.start))
+    return out
+
+
+def key(fnd):
+    return (SEV[fnd['sev']], fnd['code'], fnd['url'])
+
+
+def group(found):
+    """Одна и та же находка на двадцати страницах — это один пункт со списком адресов,
+    а не двадцать пунктов. Иначе отчёт читают до середины первой категории."""
+    by = {}
+    for f in found:
+        by.setdefault(f['code'], []).append(f)
+    out = []
+    for code, g in by.items():
+        g.sort(key=key)
+        title = checks.TITLES.get(code) or min((f['msg'] for f in g), key=len)
+        out.append(dict(code=code, sev=g[0]['sev'], cat=g[0]['cat'], fix=g[0]['fix'],
+                        title=title, items=g))
+    out.sort(key=lambda x: (SEV[x['sev']], x['code']))
+    return out
+
+
+def rank(g):
+    """Порядок работ: сначала уровень, потом собственный вес дефекта, потом охват.
+    Охват добавляет немного — двадцать страниц без lazy не обгонят одну сироту."""
+    return -((3 - SEV[g['sev']]) * 100 + checks.PRIO.get(g['code'], 0) + min(len(g['items']), 20))
+
+
+def summary(ctx, findings, stat, base_diff):
+    """Вывод в начале отчёта. Собирается из тех же находок, без фантазий: отдельным
+    полем уезжает в json, чтобы читать (и скармливать модели) можно было его одного,
+    а не сто двадцать пунктов."""
+    pages = len(ctx.pages)
+    t = ['Проверено %s, замечаний %d: критично %d, важно %d, мелочь %d.' % (
+        checks.plural(pages, 'страница', 'страницы', 'страниц'), len(findings),
+        stat['crit'], stat['warn'], stat['note'])]
+    if base_diff:
+        t.append('С прошлого прогона исправлено %d, появилось %d.' % (base_diff['fixed'], base_diff['new']))
+    groups = [g for g in group([f for f in findings if f['sure']])]
+    groups.sort(key=rank)
+    crit_cats = sorted({g['cat'] for g in groups if g['sev'] == 'crit'})
+    if crit_cats:
+        t.append('Критичное — в %s.' % ', '.join(CATNAME[c].split(' —')[0] for c in crit_cats))
+    clean = [CATNAME[c].split(' —')[0] for c in ('SEO', 'AEO', 'GEO', 'SEM', 'TECH')
+             if not any(g['cat'] == c and g['sev'] in ('crit', 'warn') for g in groups)]
+    if clean:
+        t.append('Без замечаний: %s.' % ', '.join(clean))
+    dead = [p for p in ctx.pages if p.err or not 200 <= p.status < 300]
+    if dead:
+        t.append('%s не отвечает кодом 200.' % checks.plural(len(dead), 'страница', 'страницы', 'страниц'))
+    out = [' '.join(t), '']
+    top = groups[:6]
+    if top:
+        out.append('Что делать в этом порядке:')
+        out.append('')
+        for i, g in enumerate(top, 1):
+            n = len(g['items'])
+            where = '' if n == 1 else ' — %s' % checks.plural(n, 'страница', 'страницы', 'страниц')
+            why = g['fix'].split('; ')[0].strip()
+            if len(why) > 150:
+                why = why[:150].rsplit(' ', 1)[0] + '…'
+            why = (why[:1].upper() + why[1:]).rstrip('.,') + '.' if why else ''
+            out.append('%d. **%s**%s. %s' % (i, g['title'], where, why))
+        if len(groups) > len(top):
+            out.append('')
+            out.append('Ниже — ещё %s замечаний по категориям.' % checks.plural(
+                len(groups) - len(top), 'вид', 'вида', 'видов'))
+    return '\n'.join(out)
+
+
+def report_md(ctx, findings, stat, base_diff):
+    t = ['# Аудит %s' % ctx.start,
+         '',
+         '_%s · %s_' % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), ctx.start),
+         '',
+         '## Коротко',
+         '',
+         summary(ctx, findings, stat, base_diff),
+         '']
+    unsure = [f for f in findings if not f['sure']]
+    for cat in ('SEO', 'AEO', 'GEO', 'SEM', 'TECH'):
+        got = [f for f in findings if f['cat'] == cat and f['sure']]
+        if not got:
+            continue
+        t += ['## %s' % CATNAME[cat], '']
+        for g in group(got):
+            n = len(g['items'])
+            t.append('- **%s** — %s%s' % (SEVNAME[g['sev']], g['title'],
+                                          '' if n == 1 else '  _(%d шт.)_' % n))
+            if g['fix']:
+                t.append('  → %s' % g['fix'])
+            for f in g['items'][:8]:
+                extra = '' if f['msg'] == g['title'] else ' — %s' % f['msg']
+                t.append('  - `%s`%s' % (ctx.short(f['url']), extra))
+            if n > 8:
+                t.append('  - …и ещё %d (полный список в json)' % (n - 8))
+        t.append('')
+    if unsure:
+        t += ['## Нужен глаз — эвристики, не факты', '',
+              'Эти пункты скрипт угадывает по признакам и может ошибаться. Проверять руками, '
+              'лишнее — в `ignore` конфига.', '']
+        for g in group(unsure):
+            t.append('- [%s] %s%s' % (g['cat'], g['title'], '' if len(g['items']) == 1 else '  _(%d шт.)_' % len(g['items'])))
+            for f in g['items'][:6]:
+                extra = '' if f['msg'] == g['title'] else ' — %s' % f['msg']
+                t.append('  - `%s`%s' % (ctx.short(f['url']), extra))
+        t.append('')
+    t += ['## Страницы', '', '| адрес | код | title | h1 | знаков | находок |', '|---|---|---|---|---|---|']
+    for p in ctx.pages:
+        t.append('| %s | %s | %d | %d | %d | %d |' % (
+            ctx.short(p.url), p.err or p.status, len(p.title), len(p.h1), len(p.text), len(getattr(p, '_findings', []))))
+    t += ['', '## Чего здесь нет', '',
+          'Скрипт не рендерит JS, не меряет Core Web Vitals (это поле, а не разметка), не судит о качестве '
+          'текста и не знает, по каким запросам страница должна находиться. Он проверяет разметку и связи. '
+          'Всё остальное по-прежнему смотрят глазами.', '']
+    return '\n'.join(t)
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Мини-аудит SEO/AEO/GEO по чек-листу')
+    ap.add_argument('url', nargs='?', help='стартовый адрес, например https://ritmo.studio/')
+    ap.add_argument('--local', help='папка с готовыми .html вместо живого сайта')
+    ap.add_argument('--out', default='audit-reports', help='куда класть отчёты')
+    ap.add_argument('--max-pages', type=int, default=50)
+    ap.add_argument('--max-depth', type=int, default=5)
+    ap.add_argument('--delay', type=float, default=1.0, help='пауза между запросами, с')
+    ap.add_argument('--timeout', type=int, default=15)
+    ap.add_argument('--budget', type=int, default=0, help='потолок запросов за прогон (по умолчанию 2×страниц+40)')
+    ap.add_argument('--cache', type=int, default=0, help='секунд держать ответы в .audit-cache')
+    ap.add_argument('--with-query', action='store_true', help='обходить адреса с параметрами')
+    ap.add_argument('--ignore-robots', action='store_true', help='только для своего сайта')
+    ap.add_argument('--insecure', action='store_true', help='не проверять сертификат')
+    ap.add_argument('--config', help='json с порогами, ignore и словами-заполнителями')
+    ap.add_argument('--baseline', help='json прошлого прогона для сравнения')
+    ap.add_argument('--fail-on', choices=['crit', 'warn', 'none'], default='none',
+                    help='вернуть код 2, если есть находки такого уровня (для cron и CI)')
+    ap.add_argument('--quiet', action='store_true')
+    ap.add_argument('--list', action='store_true', help='напечатать чек-лист и выйти')
+    a = ap.parse_args()
+    if a.list:
+        for cat in ('SEO', 'AEO', 'GEO', 'SEM', 'TECH'):
+            print('\n%s' % CATNAME[cat])
+            for code, t in sorted(checks.TITLES.items()):
+                if code.split('-')[0] == cat:
+                    print('  %-22s %s' % (code, t))
+        return 0
+    log = (lambda *x: None) if a.quiet else (lambda *x: print(*x, flush=True))
+
+    cfg = {}
+    if a.config:
+        cfg = json.loads(pathlib.Path(a.config).read_text(encoding='utf-8'))
+    if a.local:
+        d = pathlib.Path(a.local).resolve()
+        start = 'file://%s/' % d
+        cfg['_dir'] = str(d)
+    elif a.url:
+        start = norm_url(a.url if '://' in a.url else 'https://' + a.url)
+    else:
+        ap.error('нужен адрес сайта или --local')
+
+    out = pathlib.Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    tag = re.sub(r'\W+', '-', urllib.parse.urlsplit(start).netloc or pathlib.Path(start).name).strip('-') or 'local'
+    lock = out / ('%s.lock' % tag)
+    if lock.exists() and (datetime.datetime.now().timestamp() - lock.stat().st_mtime) < 7200:
+        print('уже идёт прогон (%s). Если это не так — удалить файл.' % lock)
+        return 1
+    lock.write_text(str(os.getpid()))
+    ctx = Ctx(start, cfg, local=bool(a.local), cached=bool(a.cache))
+    try:
+        if a.local:
+            log('Локальный аудит: %s' % cfg['_dir'])
+            crawl_local(ctx, log)
+            check_rest(ctx, None, log)
+        else:
+            f = fetch.Fetcher(delay=a.delay, timeout=a.timeout,
+                              budget=a.budget or (a.max_pages * 2 + 40),
+                              cache=a.cache, obey_robots=not a.ignore_robots, insecure=a.insecure, log=log)
+            log('Аудит %s — пауза %.1f с, потолок %d страниц' % (start, a.delay, a.max_pages))
+            f.robots(start)
+            crawl(ctx, f, a.max_pages, a.max_depth, a.with_query, log)
+            check_rest(ctx, f, log)
+            probes(ctx, f, log)
+            log('запросов потрачено: %d' % f.used)
+    except fetch.Stop as e:
+        log('ОСТАНОВ: %s. Отчёт соберём по тому, что успели.' % e)
+    except KeyboardInterrupt:
+        log('прервано вручную')
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+    run_checks(ctx)
+    findings = [f for p in ctx.pages for f in getattr(p, '_findings', [])] + run_site_checks(ctx)
+    skipped = [f for f in findings if ctx.ignored(f)]
+    findings = [f for f in findings if not ctx.ignored(f)]
+    if skipped:
+        log('снято правилами ignore: %d' % len(skipped))
+    stat = {k: sum(1 for f in findings if f['sev'] == k) for k in SEV}
+    base_diff = None
+    if a.baseline and pathlib.Path(a.baseline).exists():
+        old = json.loads(pathlib.Path(a.baseline).read_text(encoding='utf-8'))
+        was = {(f['code'], f['url']) for f in old.get('findings', [])}
+        now = {(f['code'], f['url']) for f in findings}
+        base_diff = {'fixed': len(was - now), 'new': len(now - was)}
+
+    stamp = datetime.datetime.now().strftime('%Y-%m-%d-%H%M')
+    brief = summary(ctx, findings, stat, base_diff)
+    data = dict(start=start, when=stamp, summary=brief, pages=[dict(url=p.url, status=p.err or p.status, title=p.title,
+                                                     h1=p.h1, text=len(p.text)) for p in ctx.pages],
+                stat=stat, diff=base_diff, findings=sorted(findings, key=key))
+    md_path = out / ('%s-%s.md' % (tag, stamp))
+    md_path.write_text(report_md(ctx, findings, stat, base_diff), encoding='utf-8')
+    (out / ('%s-%s.json' % (tag, stamp))).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
+    (out / ('%s-latest.json' % tag)).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
+    print('\n' + brief)
+    print('\nотчёт: %s' % md_path)
+    if a.fail_on == 'crit' and stat['crit']:
+        return 2
+    if a.fail_on == 'warn' and (stat['crit'] or stat['warn']):
+        return 2
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

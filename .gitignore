@@ -1,0 +1,6 @@
+.DS_Store
+.claude/settings.local.json
+# результаты прогонов и кэш ответов — локальные, в репозиторий не едут
+reports/
+audit-reports/
+.audit-cache/

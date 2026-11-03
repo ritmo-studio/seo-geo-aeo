@@ -1,0 +1,16 @@
+{
+  "_": "Конфиг прогона: python3 audit.py https://site.ru/ --config audit.example.json",
+  "ignore": [
+    "SEM-NO-NAV",
+    "TECH-IMG-LAZY",
+    "SEO-THIN@/tags/",
+    "AEO-NO-SCHEMA@/preview"
+  ],
+  "placeholders": ["рыба", "текст про компанию"],
+  "limits": {
+    "title_max": 65,
+    "desc_max": 170,
+    "text_min": 1200,
+    "ms_slow": 1500
+  }
+}
