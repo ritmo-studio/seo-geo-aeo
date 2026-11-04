@@ -476,6 +476,11 @@ def s_orphans(ctx):
     known = {p.url for p in ctx.pages}
     if not any(s - {u} for u, s in ctx.link_src.items() if u in known):
         return
+    # Граф пройден не целиком — любая невзятая страница выглядит сиротой. Молчим:
+    # три тысячи ложных сирот прячут ту одну настоящую, ради которой проверка и есть.
+    # Что именно не проверено, сказано в «Коротко».
+    if not ctx.cover.get('full_graph', True):
+        return
     for p in ctx.ok_pages():
         if ctx.is_home(p.url):
             continue

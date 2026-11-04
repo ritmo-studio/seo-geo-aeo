@@ -37,6 +37,10 @@ class Ctx:
         self.pages, self.link_status, self.link_src = [], {}, {}
         self.asset_status = {}       # og:image и иконки: проверяем, но это не перелинковка
         self.sitemap, self.robots, self.probe = {}, {}, {}
+        # Чем прогон накрыл сайт. Без этого отчёт по выборке из сорока страниц
+        # читается как отчёт по всему сайту — и «сирот» в нём будет три тысячи.
+        self.cover = {'mode': 'links', 'cap': 0, 'per': 0, 'sitemap': 0,
+                      'templates': 0, 'picked': 0, 'full_graph': True, 'link_skipped': 0}
 
     def internal(self, url):
         if self.local:
@@ -76,10 +80,54 @@ def crawlable(u):
     return bool(u) and not u.lower().split('?')[0].endswith(SKIP_EXT)
 
 
+# ──────────────────── выборка страниц на большом сайте ────────────────────
+
+def shape(url):
+    """Форма пути: /cases/rabachev/ → /cases/*, /blog/2026/01/post/ → /blog/N/N/*.
+
+    На сайте с тремя тысячами страниц дефекты сидят не в страницах, а в шаблонах:
+    десяток форм пути описывает весь сайт, и по три страницы каждой формы находят
+    почти всё, что нашёл бы полный обход, — за минуты вместо часов."""
+    segs = [x for x in (urllib.parse.urlsplit(url).path or '/').split('/') if x]
+    if not segs:
+        return '/'
+    segs = ['N' if x.isdigit() else x for x in segs]
+    return '/%s/' % segs[0] if len(segs) == 1 else '/%s/*' % '/'.join(segs[:-1])
+
+
+def sample(urls, per, cap):
+    """По `per` адресов на форму пути, но не больше `cap` всего. Сначала по одному
+    с каждой формы: охват шаблонов важнее глубины внутри одного шаблона."""
+    per, cap = max(1, per), max(1, cap)
+    groups = {}
+    for u in urls:
+        groups.setdefault(shape(u), []).append(u)
+    if len(groups) > cap:
+        # Плоские адреса (/post-slug/ у WordPress) дают тысячу форм по одному адресу.
+        # Это одна форма, а не тысяча.
+        flat = {}
+        for k, g in groups.items():
+            flat.setdefault('/*' if len(g) == 1 else k, []).extend(g)
+        groups = flat
+    size = {k: len(g) for k, g in groups.items()}
+    for k, g in groups.items():
+        g = sorted(g)
+        step = max(1, len(g) // per)          # разброс по списку, а не первые N подряд
+        groups[k] = (g[::step] or g)[:per]
+    order = sorted(groups, key=lambda k: (-size[k], k))
+    picked = []
+    for i in range(per):
+        for k in order:
+            if i < len(groups[k]) and len(picked) < cap:
+                picked.append(groups[k][i])
+    return picked, size
+
+
 # ─────────────────────────── сбор страниц ───────────────────────────
 
-def crawl(ctx, f, max_pages, max_depth, with_query, log):
-    queue, seen = [(ctx.start, 0)], {ctx.start}
+def crawl(ctx, f, max_pages, max_depth, with_query, log, seeds=None):
+    seeds = list(seeds or [ctx.start])
+    queue, seen = [(u, 0) for u in seeds], set(seeds)
     while queue and len(ctx.pages) < max_pages:
         url, depth = queue.pop(0)
         if not f.allowed(url):
@@ -91,6 +139,7 @@ def crawl(ctx, f, max_pages, max_depth, with_query, log):
         ctx.link_status[url] = r.status
         log('  [%d] %s %s%s' % (len(ctx.pages), r.status or 'ERR', url, ' — %s' % r.err if r.err else ''))
         if not r.is_html or not r.ok:
+            check_page(p, ctx)
             continue
         for u, text, a, href in p.links:
             if not u:
@@ -106,11 +155,21 @@ def crawl(ctx, f, max_pages, max_depth, with_query, log):
             seen.add(u)
             if depth + 1 <= max_depth and len(seen) <= max_pages * 3:
                 queue.append((u, depth + 1))
+        check_page(p, ctx)
 
 
-def check_rest(ctx, f, log):
-    """Ссылки, до которых обход не дошёл, и картинки шеринга — HEAD'ом, по одной."""
+def check_rest(ctx, f, log, cap=0):
+    """Ссылки, до которых обход не дошёл, и картинки шеринга — HEAD'ом, по одной.
+
+    На большом сайте сорок страниц ссылаются на восемьсот адресов, и проверка ссылок
+    съедает весь бюджет запросов раньше, чем доходит до проб. Поэтому потолок и
+    порядок: сначала то, на что ссылаются с большего числа страниц."""
     todo = [u for u in ctx.link_src if u not in ctx.link_status]
+    todo.sort(key=lambda u: (-len(ctx.link_src[u]), u))
+    if cap and len(todo) > cap:
+        ctx.cover['link_skipped'] = len(todo) - cap
+        log('ссылок на проверку %d — проверим %d, на которые ссылаются чаще всего' % (len(todo), cap))
+        todo = todo[:cap]
     assets = sorted({a for p in ctx.ok_pages() for a in p.assets() if ctx.internal(a)})
     for u in todo:
         ctx.link_status[u] = 200 if (ctx.local and local_exists(ctx, u)) else (404 if ctx.local else f.head(u).status)
@@ -189,24 +248,32 @@ def crawl_local(ctx, log):
         ctx.pages.append(p)
         ctx.link_status[url] = 200
         log('  [%d] %s' % (len(ctx.pages), rel))
-    for p in ctx.pages:
         for u, t, a, href in p.links:
             u = norm_url(u)
             if u and ctx.internal(u):
                 ctx.link_src.setdefault(u, set()).add(p.url)
+        check_page(p, ctx)
 
 
 # ─────────────────────────── отчёт ───────────────────────────
 
+def check_page(p, ctx):
+    """Прогнать проверки одной страницы и отпустить её разметку. Вызывается сразу
+    после разбора: держать тысячу страниц в памяти до конца обхода незачем."""
+    for fn in checks.PAGE:
+        try:
+            p._findings += [x for x in fn(p, ctx) if x]
+        except Exception as e:
+            p._findings.append(checks.F('TOOL-ERR', 'TECH', 'note',
+                                        'проверка %s упала: %s' % (fn.__name__, e), '', p.url))
+    p._checked = True
+    p.release()
+
+
 def run_checks(ctx):
     for p in ctx.pages:
-        p._findings = getattr(p, '_findings', [])
-        for fn in checks.PAGE:
-            try:
-                p._findings += [x for x in fn(p, ctx) if x]
-            except Exception as e:
-                p._findings.append(checks.F('TOOL-ERR', 'TECH', 'note',
-                                            'проверка %s упала: %s' % (fn.__name__, e), '', p.url))
+        if not getattr(p, '_checked', False):
+            check_page(p, ctx)
 
 
 def run_site_checks(ctx):
@@ -247,6 +314,26 @@ def rank(g):
     return -((3 - SEV[g['sev']]) * 100 + checks.PRIO.get(g['code'], 0) + min(len(g['items']), 20))
 
 
+def cover_note(ctx):
+    """Чем прогон накрыл сайт. Фраза обязательная: «замечаний 69» без охвата читается
+    как «на сайте 69 проблем», а это 69 на выборке из сорока страниц."""
+    cv, out = ctx.cover, []
+    if cv['mode'] == 'sample':
+        out.append('Это выборка: %s из %d в sitemap, по %d на каждую из %s пути.' % (
+            checks.plural(cv['picked'], 'страница', 'страницы', 'страниц'),
+            cv['sitemap'], cv['per'],
+            checks.plural(cv['templates'], 'формы', 'форм', 'форм')))
+    elif not cv['full_graph'] and len(ctx.pages) >= cv['cap'] and cv['cap']:
+        out.append('Обход остановился на потолке %d страниц — на сайте их больше.' % cv['cap'])
+    if not cv['full_graph']:
+        out.append('Сироты и перелинковка целиком не проверялись: для них нужен прогон '
+                   '`--crawl links` с потолком выше числа страниц сайта.')
+    if cv['link_skipped']:
+        out.append('%s осталось без проверки на 404 — не хватило потолка.' % checks.plural(
+            cv['link_skipped'], 'ссылка', 'ссылки', 'ссылок'))
+    return out
+
+
 def summary(ctx, findings, stat, base_diff):
     """Вывод в начале отчёта. Собирается из тех же находок, без фантазий: отдельным
     полем уезжает в json, чтобы читать (и скармливать модели) можно было его одного,
@@ -257,6 +344,7 @@ def summary(ctx, findings, stat, base_diff):
         stat['crit'], stat['warn'], stat['note'])]
     if base_diff:
         t.append('С прошлого прогона исправлено %d, появилось %d.' % (base_diff['fixed'], base_diff['new']))
+    t += cover_note(ctx)
     groups = [g for g in group([f for f in findings if f['sure']])]
     groups.sort(key=rank)
     crit_cats = sorted({g['cat'] for g in groups if g['sev'] == 'crit'})
@@ -329,7 +417,7 @@ def report_md(ctx, findings, stat, base_diff):
     t += ['## Страницы', '', '| адрес | код | title | h1 | знаков | находок |', '|---|---|---|---|---|---|']
     for p in ctx.pages:
         t.append('| %s | %s | %d | %d | %d | %d |' % (
-            ctx.short(p.url), p.err or p.status, len(p.title), len(p.h1), len(p.text), len(getattr(p, '_findings', []))))
+            ctx.short(p.url), p.err or p.status, len(p.title), len(p.h1), p.text_len, len(getattr(p, '_findings', []))))
     t += ['', '## Чего здесь нет', '',
           'Скрипт не рендерит JS, не меряет Core Web Vitals (это поле, а не разметка), не судит о качестве '
           'текста и не знает, по каким запросам страница должна находиться. Он проверяет разметку и связи. '
@@ -344,6 +432,14 @@ def main():
     ap.add_argument('--out', default='audit-reports', help='куда класть отчёты')
     ap.add_argument('--max-pages', type=int, default=50)
     ap.add_argument('--max-depth', type=int, default=5)
+    ap.add_argument('--crawl', choices=['auto', 'links', 'sample'], default='auto',
+                    help='как набрать страницы: по ссылкам от главной, выборкой по формам пути '
+                         'из sitemap или auto (выборка, если в sitemap адресов больше потолка)')
+    ap.add_argument('--per-template', type=int, default=3,
+                    help='сколько страниц брать на каждую форму пути в режиме выборки')
+    ap.add_argument('--max-link-checks', type=int, default=0,
+                    help='потолок HEAD-проверок ссылок, до которых не дошёл обход '
+                         '(по умолчанию max(40, страниц))')
     ap.add_argument('--delay', type=float, default=1.0, help='пауза между запросами, с')
     ap.add_argument('--timeout', type=int, default=15)
     ap.add_argument('--budget', type=int, default=0, help='потолок запросов за прогон (по умолчанию 2×страниц+40)')
@@ -399,9 +495,31 @@ def main():
                               cache=a.cache, obey_robots=not a.ignore_robots, insecure=a.insecure, log=log)
             log('Аудит %s — пауза %.1f с, потолок %d страниц' % (start, a.delay, a.max_pages))
             f.robots(start)
-            crawl(ctx, f, a.max_pages, a.max_depth, a.with_query, log)
-            check_rest(ctx, f, log)
+            # robots.txt и sitemap читаем до обхода: на большом сайте именно sitemap
+            # решает, какие страницы брать.
             probes(ctx, f, log)
+            sm = ctx.sitemap.get('urls') or []
+            per = max(1, a.per_template)
+            ctx.cover.update(sitemap=len(sm), cap=a.max_pages, per=per)
+            mode = a.crawl
+            if mode == 'auto':
+                mode = 'sample' if len(sm) > a.max_pages else 'links'
+            if mode == 'sample' and not sm:
+                log('выборку делать не из чего: в sitemap нет адресов — идём по ссылкам')
+                mode = 'links'
+            ctx.cover['mode'] = mode
+            if mode == 'sample':
+                picked, sizes = sample(sm, per, a.max_pages)
+                # Главная первой: если она не отвечает, остальное обсуждать нечего.
+                picked = [start] + [u for u in picked if u != start][:a.max_pages - 1]
+                ctx.cover.update(templates=len(sizes), picked=len(picked))
+                log('В sitemap %d адресов, форм пути %d — берём %s по %d на форму'
+                    % (len(sm), len(sizes),
+                       checks.plural(len(picked), 'страницу', 'страницы', 'страниц'), per))
+                crawl(ctx, f, a.max_pages, 0, a.with_query, log, seeds=picked)
+            else:
+                crawl(ctx, f, a.max_pages, a.max_depth, a.with_query, log)
+            check_rest(ctx, f, log, cap=a.max_link_checks or max(40, a.max_pages))
             log('запросов потрачено: %d' % f.used)
     except fetch.Stop as e:
         log('ОСТАНОВ: %s. Отчёт соберём по тому, что успели.' % e)
@@ -412,6 +530,16 @@ def main():
             lock.unlink()
         except OSError:
             pass
+
+    if not ctx.local:
+        crawled = {p.url for p in ctx.pages}
+        unseen = [u for u in (ctx.sitemap.get('urls') or []) if u not in crawled and u not in ctx.link_src]
+        # Про сирот и перелинковку можно говорить только когда граф пройден целиком:
+        # обход по ссылкам, не упёрся в потолок и в sitemap нет адресов, которых мы
+        # вообще не видели. Иначе любая невзятая страница выглядит сиротой.
+        ctx.cover['full_graph'] = (ctx.cover['mode'] == 'links'
+                                   and len(ctx.pages) < ctx.cover['cap']
+                                   and not unseen)
 
     run_checks(ctx)
     findings = [f for p in ctx.pages for f in getattr(p, '_findings', [])] + run_site_checks(ctx)
@@ -430,7 +558,7 @@ def main():
     stamp = datetime.datetime.now().strftime('%Y-%m-%d-%H%M')
     brief = summary(ctx, findings, stat, base_diff)
     data = dict(start=start, when=stamp, summary=brief, pages=[dict(url=p.url, status=p.err or p.status, title=p.title,
-                                                     h1=p.h1, text=len(p.text)) for p in ctx.pages],
+                                                     h1=p.h1, text=p.text_len) for p in ctx.pages],
                 stat=stat, diff=base_diff, findings=sorted(findings, key=key))
     md_path = out / ('%s-%s.md' % (tag, stamp))
     md_path.write_text(report_md(ctx, findings, stat, base_diff), encoding='utf-8')
