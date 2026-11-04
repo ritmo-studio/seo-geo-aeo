@@ -34,9 +34,16 @@ UA = 'ritmo-audit/1.0 (+https://ritmo.studio/)'
 # Имена метрик у Метрики менялись, а проверить их без живого токена нельзя.
 # Поэтому списком кандидатов: берём первый, который ответил, и записываем в json,
 # какой именно сработал — иначе через месяц непонятно, что означает число.
-LOAD_TIME = ['ym:pv:avgPageLoadTime', 'ym:s:avgPageLoadTime', 'ym:pv:avgDOMContentLoadTime']
-SRV_TIME = ['ym:pv:avgServerResponseTime', 'ym:s:avgServerResponseTime']
-SOURCE_DIM = ['ym:s:lastsignTrafficSource', 'ym:s:trafficSource']
+# Время загрузки: 4 ноября 2026 перебрал шестнадцать имён (ym:pv: и ym:s:,
+# avgPageLoadTime, avgDOMContentLoadTime, avgServerResponseTime, avgTimeToFirstByte
+# и далее) — все дали «Incorrectly specified attribute», и пресета под этот отчёт
+# тоже нет. Похоже, отчёт «Время загрузки страниц» из интерфейса через
+# Reporting API не отдаётся вовсе. Список оставлен на случай, что имена появятся,
+# но полагаться на него нельзя: скорость у живых людей берём из CrUX/PageSpeed,
+# он для этого и сделан. Перебирать заново не нужно — вот результат.
+LOAD_TIME = ['ym:pv:avgPageLoadTime', 'ym:s:avgPageLoadTime']
+SRV_TIME = ['ym:pv:avgServerResponseTime']
+SOURCE_DIM = ['ym:s:lastsignTrafficSource', 'ym:s:lastTrafficSource', 'ym:s:trafficSource']
 
 
 def api(url, token, params=None, timeout=60):
@@ -89,15 +96,22 @@ def stat(token, counter, metrics, dimensions='', days=30, limit=20, sort=''):
     return api(MET + '/stat/v1/data', token, p)
 
 
-def first_working(token, counter, candidates, dimensions='', days=30):
+def first_working(token, counter, candidates, as_dim=False, days=30):
     """Перебрать кандидатов и вернуть (имя, данные). Пустой ответ — тоже успех:
-    отсутствие данных и отсутствие метрики — разные вещи."""
+    отсутствие данных и отсутствие метрики — разные вещи.
+
+    `as_dim` обязателен: измерение и метрика идут в разные параметры запроса, и
+    живое имя, попавшее не в тот параметр, выглядит как несуществующее. На этом
+    я и обжёгся — источники «не выгружались», хотя измерение работало."""
     tried = []
     for name in candidates:
-        d, err = stat(token, counter, name, dimensions, days=days, limit=100)
+        if as_dim:
+            d, err = stat(token, counter, 'ym:s:visits', name, days=days, limit=100)
+        else:
+            d, err = stat(token, counter, name, days=days, limit=100)
         if not err:
             return name, d, tried
-        tried.append('%s — %s' % (name, err.split(':')[0]))
+        tried.append('%s — %s' % (name, err[:160]))
     return '', None, tried
 
 
@@ -109,16 +123,27 @@ def num(d, i=0):
     return v[i] if i < len(v) else None
 
 
+def domains(counter):
+    """Домены счётчика. `site2` приходит то списком строк, то списком словарей —
+    зависит от возраста счётчика, в документации об этом ни слова. Разбираем оба
+    вида и всё незнакомое просто приводим к строке: промахнуться именем поля
+    дешевле, чем уронить всю выгрузку на ровном месте."""
+    out = [counter.get('site') or '']
+    for s in (counter.get('site2') or []):
+        out.append(s.get('site', '') if isinstance(s, dict) else '%s' % s)
+    return [x for x in out if x]
+
+
 def find_counter(token, host):
     d, err = api(MET + '/management/v1/counters', token, {'per_page': 200})
     if err:
         return 0, err
     got = d.get('counters') or []
     for c in got:
-        sites = [c.get('site') or ''] + [s.get('site', '') for s in (c.get('site2') or [])]
-        if any(host in s for s in sites):
+        if any(host in s for s in domains(c)):
             return c.get('id'), ''
-    return 0, 'счётчик для %s не найден среди %d доступных' % (host, len(got))
+    names = ', '.join(sorted({s for c in got for s in domains(c)}))[:200]
+    return 0, 'счётчик для %s не найден. Доступны: %s' % (host, names or 'ни одного')
 
 
 def metrika(token, host, days, probe):
@@ -138,7 +163,7 @@ def metrika(token, host, days, probe):
         t = (d.get('totals') or [None] * 4)
         out.update(visits=t[0], users=t[1], bounce=t[2], duration=t[3], days=days)
 
-    dim, d, tried = first_working(token, counter, SOURCE_DIM, days=days)
+    dim, d, tried = first_working(token, counter, SOURCE_DIM, as_dim=True, days=days)
     if dim:
         rows = [(r['dimensions'][0].get('name') or '?', r['metrics'][0])
                 for r in (d.get('data') or [])]
@@ -162,6 +187,9 @@ def metrika(token, host, days, probe):
         out['server_metric'] = name
     elif probe:
         out['notes'].append('Метрика, ответ сервера: не вышло (%s)' % '; '.join(tried))
+    if 'load_ms' not in out:
+        out['notes'].append('Скорость у живых людей Метрика через API не отдаёт — '
+                            'брать из CrUX/PageSpeed.')
 
     d, err = stat(token, counter, 'ym:s:visits,ym:s:bounceRate', 'ym:s:startURL',
                   days=days, limit=15, sort='-ym:s:visits')
@@ -186,11 +214,20 @@ def wm_host(token, host):
     if err:
         return uid, '', 'Вебмастер, список хостов: %s' % err
     got = hs.get('hosts') or []
+    # Домен может быть не хостом, а главным зеркалом другого хоста: у ritmo.studio
+    # в Вебмастере подтверждён unitbox.one, а ritmo.studio висит его зеркалом.
+    # Данные отдаются по подтверждённому host_id, поэтому ищем и среди зеркал,
+    # а подмену объявляем вслух — иначе цифры будут про «не тот» сайт.
     for h in got:
-        names = '%s %s' % (h.get('ascii_host_url') or '', h.get('unicode_host_url') or '')
-        if host in names:
+        if host in '%s %s' % (h.get('ascii_host_url') or '', h.get('unicode_host_url') or ''):
             return uid, h.get('host_id'), ''
-    return uid, '', 'Вебмастер: хост %s не найден (доступно %d)' % (host, len(got))
+    for h in got:
+        mm = h.get('main_mirror') or {}
+        if host in '%s %s' % (mm.get('ascii_host_url') or '', mm.get('unicode_host_url') or ''):
+            return uid, h.get('host_id'), 'зеркало: %s подтверждён как %s, цифры по нему' % (
+                host, h.get('ascii_host_url'))
+    names = ', '.join((h.get('ascii_host_url') or '?') for h in got)
+    return uid, '', 'Вебмастер: хост %s не найден. Доступны: %s' % (host, names or 'ни одного')
 
 
 def webmaster(token, host, probe):
@@ -200,46 +237,54 @@ def webmaster(token, host, probe):
         out['notes'].append(err)
         return out
     out['host_id'] = hid
+    if err:
+        out['notes'].append('Вебмастер, %s' % err)
 
     base = '%s/user/%s/hosts/%s' % (WM, uid, hid)
     d, err = api(base + '/summary/', token)
     if err:
-        d, err = api(base + '/summary', token)
-    if err:
         out['notes'].append('Вебмастер, сводка: %s' % err)
     else:
         out['sqi'] = d.get('sqi')
-        out['summary_raw'] = {k: v for k, v in d.items() if not isinstance(v, (dict, list))}
+        out['in_search'] = d.get('searchable_pages_count')
+        out['excluded'] = d.get('excluded_pages_count')
+        out['problem_count'] = d.get('site_problems') or {}
 
-    # Главные две цифры: сколько страниц робот загрузил и сколько из них в поиске.
-    for path, params in (('/search-urls/in-search/history/', {}),
-                         ('/indexing/history/', {'indexing_indicator': 'SEARCHABLE'}),
-                         ('/indexing/history/', {'indexing_indicator': 'DOWNLOADED'})):
-        d, err = api(base + path, token, params or None)
-        if err:
-            if probe:
-                out['notes'].append('Вебмастер %s %s: %s' % (path, params, err))
-            continue
-        pts = d.get('history') or d.get('indicators') or []
-        if isinstance(pts, dict):
-            pts = sum(pts.values(), [])
+    # Страницы в поиске в динамике: одна цифра не отличает «так и было»
+    # от «вчера выпала половина».
+    d, err = api(base + '/search-urls/in-search/history/', token)
+    if err:
+        out['notes'].append('Вебмастер, история поиска: %s' % err)
+    else:
+        pts = [(x.get('date', '')[:10], x.get('value')) for x in (d.get('history') or [])]
         if pts:
-            last = pts[-1]
-            key = params.get('indexing_indicator', 'IN_SEARCH').lower()
-            out.setdefault('pages', {})[key] = last.get('value')
-            out.setdefault('pages_date', {})[key] = last.get('date')
+            out['in_search_history'] = {'from': pts[0], 'to': pts[-1], 'points': len(pts)}
+
+    # Коды ответа глазами робота. Ради этого всё и затевалось: свой замер я могу
+    # объяснить вежливостью краулера, а тут таймауты и пятисотки считает Яндекс.
+    d, err = api(base + '/indexing/history/', token, {'indexing_indicator': 'DOWNLOADED'})
+    if err:
+        out['notes'].append('Вебмастер, коды ответа: %s' % err)
+    else:
+        codes = {}
+        for name, pts in (d.get('indicators') or {}).items():
+            if pts:
+                codes[name] = pts[-1].get('value')
+        out['codes'] = codes
 
     d, err = api(base + '/diagnostics/', token)
     if err:
         out['notes'].append('Вебмастер, диагностика: %s' % err)
     else:
-        items = d.get('problems') or []
-        if isinstance(items, dict):
-            items = sum((v if isinstance(v, list) else [v]) for v in items.values())
-        out['problems'] = [{'name': p.get('problem_type') or p.get('name'),
-                            'severity': p.get('severity') or p.get('state')}
-                           for p in items][:20]
-    out['ok'] = bool(out.get('pages') or out.get('sqi') is not None)
+        probs = d.get('problems') or {}
+        # ABSENT и NOT_APPLICABLE — это «проверено, всё в порядке». В список
+        # проблем они попадать не должны: отчёт из восьми небылиц не читают.
+        out['problems'] = [
+            {'name': k, 'severity': (v or {}).get('severity'), 'state': (v or {}).get('state')}
+            for k, v in sorted(probs.items())
+            if isinstance(v, dict) and v.get('state') not in ('ABSENT', 'NOT_APPLICABLE', None)]
+
+    out['ok'] = bool(out.get('in_search') is not None or out.get('codes'))
     return out
 
 
@@ -271,21 +316,37 @@ def brief(m, w, host, days):
                 '%s — %s визитов, отказы %.0f%%' % (e['url'], e['visits'], e['bounce'])
                 for e in ent[:5]) + '.')
     if w.get('ok'):
-        p = w.get('pages') or {}
-        if p.get('downloaded') and p.get('searchable') is not None:
-            t.append('Вебмастер: загружено %s страниц, в поиске %s — из индекса выпало %s.' % (
-                p['downloaded'], p['searchable'], p['downloaded'] - p['searchable']))
-        elif p:
-            t.append('Вебмастер, страницы: ' + ', '.join('%s %s' % (k, v) for k, v in p.items()) + '.')
+        line = 'Вебмастер: в поиске %s страниц' % w.get('in_search')
+        if w.get('excluded'):
+            line += ', исключено %s' % w['excluded']
         if w.get('sqi') is not None:
-            t.append('ИКС %s.' % w['sqi'])
+            line += ', ИКС %s' % w['sqi']
+        t.append(line + '.')
+        h = w.get('in_search_history') or {}
+        if h.get('from') and h.get('to') and h['from'][1] != h['to'][1]:
+            t.append('Страниц в поиске: %s на %s → %s на %s.' % (
+                h['from'][1], h['from'][0], h['to'][1], h['to'][0]))
+        c = w.get('codes') or {}
+        if c:
+            t.append('Коды ответа глазами робота: ' + ', '.join(
+                '%s %s' % (k.replace('HTTP_', ''), v) for k, v in sorted(c.items())) + '.')
         pr = w.get('problems') or []
-        if pr:
-            t.append('Диагностика: ' + ', '.join(str(x['name']) for x in pr[:8]) + '.')
+        t.append('Проблемы в диагностике: ' + (', '.join(
+            '%s (%s)' % (x['name'], x['severity']) for x in pr[:8]) if pr else 'нет.'))
     notes = (m.get('notes') or []) + (w.get('notes') or [])
     if notes:
         t.append('Не выгрузилось: ' + ' | '.join(notes))
     return '\n'.join(t) or 'Выгрузить не удалось ничего — смотреть notes в json.'
+
+
+def safe(fn, label, *args):
+    """Разбор чужого json — главный источник сюрпризов: поле приходит не того вида,
+    и трейсбек уносит с собой уже выгруженное. Ловим и пишем в notes."""
+    try:
+        return fn(*args)
+    except Exception as e:
+        return {'ok': False, 'notes': ['%s: разбор ответа упал — %s: %s' % (
+            label, type(e).__name__, e)]}
 
 
 def main():
@@ -307,9 +368,9 @@ def main():
 
     host = a.host.replace('https://', '').replace('http://', '').strip('/')
     print('Выгрузка %s за %d дней' % (host, a.days))
-    m = metrika(token, host, a.days, a.probe)
+    m = safe(metrika, 'Метрика', token, host, a.days, a.probe)
     print('  Метрика: %s' % ('счётчик %s' % m.get('counter') if m.get('ok') else 'нет данных'))
-    w = webmaster(token, host, a.probe)
+    w = safe(webmaster, 'Вебмастер', token, host, a.probe)
     print('  Вебмастер: %s' % ('хост найден' if w.get('ok') else 'нет данных'))
 
     text = brief(m, w, host, a.days)
