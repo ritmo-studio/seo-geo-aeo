@@ -504,6 +504,13 @@ def s_orphans(ctx):
 @site_check
 def s_robots(ctx):
     r = ctx.robots
+    # Ответа нет вовсе — файл может лежать на месте, это хост молчит. «Нет robots.txt»
+    # здесь было бы выдумкой: по такому отчёту пойдут заводить существующий файл.
+    if not r.get('status'):
+        yield F('TECH-NO-ANSWER', 'TECH', 'crit', 'robots.txt не ответил (таймаут или блокировка)',
+                'это не «файла нет», а молчание хоста: проверить вручную, поднять --timeout, '
+                'подождать сутки — возможно, сайт ограничивает частые запросы', ctx.root)
+        return
     if r.get('status') != 200:
         yield F('SEO-ROBOTS-TXT', 'SEO', 'warn', 'robots.txt отвечает %s' % r.get('status'),
                 'нужен хотя бы пустой с директивой Sitemap', ctx.root)
@@ -519,6 +526,10 @@ def s_robots(ctx):
 @site_check
 def s_sitemap(ctx):
     sm = ctx.sitemap
+    if not sm.get('status'):
+        yield F('TECH-NO-ANSWER', 'TECH', 'crit', 'sitemap.xml не ответил (таймаут или блокировка)',
+                'это не «карты нет», а молчание хоста', ctx.root)
+        return
     if sm.get('status') != 200:
         yield F('SEO-SITEMAP-MISSING', 'SEO', 'warn', 'sitemap.xml отвечает %s' % sm.get('status'),
                 'карта ускоряет переобход, особенно новым страницам', ctx.root)
@@ -638,7 +649,7 @@ TITLES = {
     'SEM-IFRAME-TITLE': 'iframe без title', 'SEM-SVG-VIEWBOX': 'svg без viewBox',
     'SEM-TABINDEX': 'положительный tabindex', 'SEM-H-EMPTY': 'пустой заголовок',
     'SEM-NO-MAIN': 'нет <main>', 'SEM-NO-HEADER': 'нет <header>', 'SEM-NO-NAV': 'нет <nav>',
-    'TECH-ERR': 'страница не загрузилась', 'TECH-CHAIN': 'цепочка редиректов',
+    'TECH-NO-ANSWER': 'хост не отвечает', 'TECH-ERR': 'страница не загрузилась', 'TECH-CHAIN': 'цепочка редиректов',
     'TECH-SLOW': 'медленный ответ сервера', 'TECH-SIZE': 'тяжёлый HTML',
     'TECH-GZIP': 'HTML без сжатия', 'TECH-BLOCKING': 'блокирующие скрипты в head',
     'TECH-IMG-DIM': 'картинки без width/height', 'TECH-IMG-LAZY': 'нет loading="lazy"',
@@ -651,7 +662,7 @@ TITLES = {
 # Страница-сирота на одной странице важнее отсутствия lazy на двадцати: вес
 # считается не числом адресов, а тем, что дефект отнимает у сайта.
 PRIO = {
-    'SEO-ORPHAN': 60, 'SEO-STATUS': 55, 'SEO-NOINDEX': 55, 'SEO-ROBOTS-ALL': 55,
+    'TECH-NO-ANSWER': 70, 'SEO-ORPHAN': 60, 'SEO-STATUS': 55, 'SEO-NOINDEX': 55, 'SEO-ROBOTS-ALL': 55,
     'SEO-LINK-404': 45, 'SEO-PLACEHOLDER': 45, 'SEO-SOFT404': 40, 'GEO-JS-ONLY': 40,
     'GEO-NO-ID': 38, 'GEO-ENTITY-SPLIT': 38, 'AEO-NO-SCHEMA': 35, 'GEO-NO-ORG': 35,
     'TECH-MIXED': 32, 'SEO-CANON-HOST': 30, 'AEO-ORG-CONTACT': 28, 'SEO-H1-MISSING': 25,
