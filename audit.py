@@ -39,6 +39,7 @@ class Ctx:
         self.sitemap, self.robots, self.probe = {}, {}, {}
         # Чем прогон накрыл сайт. Без этого отчёт по выборке из сорока страниц
         # читается как отчёт по всему сайту — и «сирот» в нём будет три тысячи.
+        self.extern = {}             # сводки соседних инструментов: Яндекс, GEO-трекер
         self.cover = {'mode': 'links', 'cap': 0, 'per': 0, 'sitemap': 0,
                       'templates': 0, 'picked': 0, 'full_graph': True, 'link_skipped': 0,
                       'link_noresp': 0}
@@ -351,6 +352,88 @@ def cover_note(ctx):
     return out
 
 
+def read_extern(out):
+    """Сводки соседних инструментов из папки клиента. Чтение односторонее и
+    необязательное: нет файла — отчёт прежний. Так аудит остаётся без ключей и
+    зависимостей, а данные всё равно встречаются в одном месте."""
+    got = {}
+    for name in ('yandex', 'geo'):
+        f = out / ('%s.json' % name)
+        if not f.exists():
+            continue
+        try:
+            got[name] = json.loads(f.read_text(encoding='utf-8'))
+        except Exception as e:
+            got[name] = {'summary': 'файл %s не разобрался: %s' % (f.name, e)}
+    return got
+
+
+def cross(ctx, findings):
+    """Сверки, которые не может сделать ни один инструмент в одиночку. Здесь и
+    только здесь аудит имеет право говорить о том, чего сам не измерял, — потому
+    что цифра рядом посчитана кем-то другим."""
+    y = ctx.extern.get('yandex') or {}
+    g = ctx.extern.get('geo') or {}
+    out = []
+    wm = (y.get('webmaster') or {})
+    in_search = wm.get('in_search')
+    live = len(ctx.ok_pages())
+    if isinstance(in_search, int) and live:
+        if in_search > live:
+            out.append('Краулер дошёл до %d страниц, в поиске Яндекса %d — %d адресов индекс '
+                       'знает, а ссылки на них не ведут: сироты или старые копии.' % (
+                           live, in_search, in_search - live))
+        elif live > in_search:
+            out.append('Краулер дошёл до %d страниц, в поиске Яндекса %d — в индекс не попало %d.'
+                       % (live, in_search, live - in_search))
+    codes = wm.get('codes') or {}
+    bad = {k: v for k, v in codes.items() if not k.endswith('2XX') and v}
+    if bad:
+        out.append('Робот Яндекса видел не только 200: %s. Свой замер можно списать на '
+                   'вежливость краулера, эти коды посчитал Яндекс.' % ', '.join(
+                       '%s %s' % (k.replace('HTTP_', ''), v) for k, v in sorted(bad.items())))
+    m = (y.get('metrika') or {})
+    # Только свои адреса: счётчик ловит и посторонние входы (mc.yandex.ru и прочий
+    # шум), а «начинать с них» было бы советом чинить чужой сайт.
+    ent = [e for e in (m.get('entries') or [])
+           if e.get('visits') and ctx.host in (e.get('url') or '')][:3]
+    if ent:
+        out.append('Зарабатывают входом: %s — с них и начинать.' % ', '.join(
+            '%s (%s)' % (e['url'], int(e['visits'])) for e in ent))
+    if g.get('share') is not None:
+        line = 'GEO-замер: бренд назван в %.1f%% ответов' % g['share']
+        if g.get('batch'):
+            line += ' (%s)' % g['batch']
+        out.append(line + '.')
+        geo_blind = [f for f in findings if f['code'] in ('GEO-NO-ORG', 'AEO-NO-SCHEMA')]
+        if geo_blind and g.get('cited') and g['cited'] > (g.get('mentioned') or 0):
+            out.append('И сходится с разметкой: сайт попал в источники %d раз, а назван %d — '
+                       'читать его модели есть что, а понять, чья это компания, нечего.' % (
+                           g['cited'], g['mentioned']))
+        fnd = [x for x in (g.get('finders') or []) if x.get('with_mention')][:3]
+        if fnd:
+            out.append('Находят через %s — не через сайт.' % ', '.join(
+                x['domain'] for x in fnd))
+    return out
+
+
+def extern_md(ctx):
+    """Раздел отчёта с чужими сводками — целиком, как их написали соседние скрипты.
+    Пересказывать их своими словами нельзя: сверка держится на том, что цифру
+    посчитал другой инструмент, и подменять её нашей формулировкой — терять смысл."""
+    t = []
+    for name, title in (('yandex', 'Метрика и Вебмастер'), ('geo', 'GEO-трекер')):
+        d = ctx.extern.get(name)
+        if not d:
+            continue
+        t += ['### %s' % title, '']
+        when = d.get('when') or ''
+        if when:
+            t += ['_замер %s_' % when, '']
+        t += [d.get('summary') or '(без сводки)', '']
+    return t
+
+
 def summary(ctx, findings, stat, base_diff):
     """Вывод в начале отчёта. Собирается из тех же находок, без фантазий: отдельным
     полем уезжает в json, чтобы читать (и скармливать модели) можно было его одного,
@@ -375,6 +458,11 @@ def summary(ctx, findings, stat, base_diff):
     if dead:
         t.append('%s не отвечает кодом 200.' % checks.plural(len(dead), 'страница', 'страницы', 'страниц'))
     out = [' '.join(t), '']
+    # Сверки — своим абзацем: это единственное место, где цифру посчитал не аудит,
+    # и слипшись с его собственными выводами она читается как его же.
+    cr = cross(ctx, findings)
+    if cr:
+        out += [' '.join(cr), '']
     top = groups[:6]
     if top:
         out.append('Что делать в этом порядке:')
@@ -409,6 +497,10 @@ def report_md(ctx, findings, stat, base_diff, verdict=''):
          '',
          summary(ctx, findings, stat, base_diff),
          '']
+    ext = extern_md(ctx)
+    if ext:
+        t += ['## Чужими глазами', '',
+              '_сводки соседних инструментов: цифры посчитаны ими, не аудитом_', ''] + ext
     unsure = [f for f in findings if not f['sure']]
     for cat in ('SEO', 'AEO', 'GEO', 'SEM', 'TECH'):
         got = [f for f in findings if f['cat'] == cat and f['sure']]
@@ -510,6 +602,7 @@ def main():
         return 1
     lock.write_text(str(os.getpid()))
     ctx = Ctx(start, cfg, local=bool(a.local), cached=bool(a.cache))
+    ctx.extern = read_extern(out)
     try:
         if a.local:
             log('Локальный аудит: %s' % cfg['_dir'])

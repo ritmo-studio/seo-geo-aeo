@@ -335,7 +335,10 @@ def brief(m, w, host, days):
             '%s (%s)' % (x['name'], x['severity']) for x in pr[:8]) if pr else 'нет.'))
     notes = (m.get('notes') or []) + (w.get('notes') or [])
     if notes:
-        t.append('Не выгрузилось: ' + ' | '.join(notes))
+        # В сводке — короткая строка: полный текст ошибки лежит в json, а в отчёте
+        # сырое тело ответа Яндекса занимает полэкрана и прячет остальное.
+        short = [(n if len(n) < 120 else n[:117].rstrip() + '…') for n in notes]
+        t.append('Не выгрузилось: ' + ' | '.join(short))
     return '\n'.join(t) or 'Выгрузить не удалось ничего — смотреть notes в json.'
 
 
