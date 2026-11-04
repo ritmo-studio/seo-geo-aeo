@@ -40,7 +40,8 @@ class Ctx:
         # Чем прогон накрыл сайт. Без этого отчёт по выборке из сорока страниц
         # читается как отчёт по всему сайту — и «сирот» в нём будет три тысячи.
         self.cover = {'mode': 'links', 'cap': 0, 'per': 0, 'sitemap': 0,
-                      'templates': 0, 'picked': 0, 'full_graph': True, 'link_skipped': 0}
+                      'templates': 0, 'picked': 0, 'full_graph': True, 'link_skipped': 0,
+                      'link_noresp': 0}
 
     def internal(self, url):
         if self.local:
@@ -173,8 +174,14 @@ def check_rest(ctx, f, log, cap=0):
     assets = sorted({a for p in ctx.ok_pages() for a in p.assets() if ctx.internal(a)})
     for u in todo:
         ctx.link_status[u] = 200 if (ctx.local and local_exists(ctx, u)) else (404 if ctx.local else f.head(u).status)
-        if not 200 <= ctx.link_status[u] < 300:
-            log('  битая ссылка: %s → %s' % (u, ctx.link_status[u]))
+        st = ctx.link_status[u]
+        # Нет ответа вообще (таймаут, обрыв) — это не 404: ссылка осталась
+        # непроверенной. Называть её битой нельзя, по ней пойдут править сайт.
+        if not st:
+            ctx.cover['link_noresp'] += 1
+            log('  не ответила: %s' % u)
+        elif not 200 <= st < 300:
+            log('  битая ссылка: %s → %d' % (u, st))
     for u in assets:
         if u in ctx.link_status:
             ctx.asset_status[u] = ctx.link_status[u]
@@ -260,7 +267,14 @@ def crawl_local(ctx, log):
 def check_page(p, ctx):
     """Прогнать проверки одной страницы и отпустить её разметку. Вызывается сразу
     после разбора: держать тысячу страниц в памяти до конца обхода незачем."""
+    # Страница не открылась — разбирать в ней нечего. Пустой ответ иначе даёт «нет
+    # title», «нет h1», «нет viewport» и ещё десяток мнимых находок на каждую
+    # упавшую страницу: на 220boom.ru тринадцать таймаутов дали 195 замечаний из
+    # 499. Говорим один раз, что страница не отвечает, — остальное после ответа.
+    live = not p.err and 200 <= p.status < 300
     for fn in checks.PAGE:
+        if not live and not getattr(fn, 'on_dead', False):
+            continue
         try:
             p._findings += [x for x in fn(p, ctx) if x]
         except Exception as e:
@@ -331,6 +345,9 @@ def cover_note(ctx):
     if cv['link_skipped']:
         out.append('%s осталось без проверки на 404 — не хватило потолка.' % checks.plural(
             cv['link_skipped'], 'ссылка', 'ссылки', 'ссылок'))
+    if cv['link_noresp']:
+        out.append('%s не ответило совсем (таймаут) — это не 404, проверить вручную.'
+                   % checks.plural(cv['link_noresp'], 'ссылка', 'ссылки', 'ссылок'))
     return out
 
 
