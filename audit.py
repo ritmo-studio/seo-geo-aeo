@@ -394,12 +394,18 @@ def summary(ctx, findings, stat, base_diff):
     return '\n'.join(out)
 
 
-def report_md(ctx, findings, stat, base_diff):
+def report_md(ctx, findings, stat, base_diff, verdict=''):
+    """Отчёт. Первым разделом — `verdict.md` из папки сайта, если он там лежит:
+    человеческий вывод живёт дольше одного прогона и пишется руками, скрипт его
+    только подклеивает и никогда не перезаписывает."""
     t = ['# Аудит %s' % ctx.start,
          '',
          '_%s · %s_' % (datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), ctx.start),
-         '',
-         '## Коротко',
+         '']
+    if verdict:
+        t += ['## Вердикт', '', verdict, '',
+              '_написано руками в `verdict.md`, прогоны его не трогают_', '']
+    t += ['## Коротко',
          '',
          summary(ctx, findings, stat, base_diff),
          '']
@@ -492,10 +498,13 @@ def main():
     else:
         ap.error('нужен адрес сайта или --local')
 
-    out = pathlib.Path(a.out)
-    out.mkdir(parents=True, exist_ok=True)
+    # Своя папка на каждый сайт: в общей куче двадцать прогонов трёх клиентов
+    # перестают читаться к концу месяца, а `verdict.md` лежит рядом со своими
+    # отчётами, а не угадывается по имени файла.
     tag = re.sub(r'\W+', '-', urllib.parse.urlsplit(start).netloc or pathlib.Path(start).name).strip('-') or 'local'
-    lock = out / ('%s.lock' % tag)
+    out = pathlib.Path(a.out) / tag
+    out.mkdir(parents=True, exist_ok=True)
+    lock = out / 'run.lock'
     if lock.exists() and (datetime.datetime.now().timestamp() - lock.stat().st_mtime) < 7200:
         print('уже идёт прогон (%s). Если это не так — удалить файл.' % lock)
         return 1
@@ -577,10 +586,14 @@ def main():
     data = dict(start=start, when=stamp, summary=brief, pages=[dict(url=p.url, status=p.err or p.status, title=p.title,
                                                      h1=p.h1, text=p.text_len) for p in ctx.pages],
                 stat=stat, diff=base_diff, findings=sorted(findings, key=key))
-    md_path = out / ('%s-%s.md' % (tag, stamp))
-    md_path.write_text(report_md(ctx, findings, stat, base_diff), encoding='utf-8')
-    (out / ('%s-%s.json' % (tag, stamp))).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
-    (out / ('%s-latest.json' % tag)).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
+    verdict = ''
+    vf = out / 'verdict.md'
+    if vf.exists():
+        verdict = vf.read_text(encoding='utf-8').strip()
+    md_path = out / ('%s.md' % stamp)
+    md_path.write_text(report_md(ctx, findings, stat, base_diff, verdict), encoding='utf-8')
+    (out / ('%s.json' % stamp)).write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
+    (out / 'latest.json').write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding='utf-8')
     print('\n' + brief)
     print('\nотчёт: %s' % md_path)
     if a.fail_on == 'crit' and stat['crit']:
