@@ -11,6 +11,7 @@
 
     python3 pull-yandex.py 220boom.ru --out reports
     python3 pull-yandex.py 220boom.ru --probe    # что из запросов вообще живо
+    python3 pull-yandex.py 220boom.ru --trend    # плюс помесячный ряд за 13 месяцев
 
 Токен лежит в файле (по умолчанию ~/.config/ritmo/yandex.token) с правами 600.
 Аргументом командной строки его не передаём никогда: аргументы видны в `ps`.
@@ -51,7 +52,7 @@ def api(url, token, params=None, timeout=60):
     """Один запрос. Возвращает (данные, ошибка) и не поднимает исключений: сорванный
     отчёт не должен уносить с собой всю остальную выгрузку."""
     if params:
-        url += '?' + urllib.parse.urlencode(params)
+        url += '?' + urllib.parse.urlencode(params, doseq=True)
     req = urllib.request.Request(url, headers={
         'Authorization': 'OAuth %s' % token,
         'User-Agent': UA,
@@ -292,6 +293,7 @@ def webmaster(token, host, probe):
         out['notes'].append(err)
         return out
     out['host_id'] = hid
+    out['uid'] = uid
     if err:
         out['notes'].append('Вебмастер, %s' % err)
 
@@ -341,6 +343,158 @@ def webmaster(token, host, probe):
 
     out['ok'] = bool(out.get('in_search') is not None or out.get('codes'))
     return out
+
+
+# ─────────────────────────────── Годовой срез ───────────────────────────────
+# Один срез на 90 дней не отличает «так и было» от «выросли вдвое без нас».
+# У spbshield.ru ссылочный профиль упал на 75% за восемь месяцев, а клики из
+# Яндекса за тот же срок удвоились — без ряда по месяцам первое выглядело бы
+# катастрофой, а это уход мусора. Поэтому ряд, и поэтому отдельным флагом:
+# он стоит полтора десятка запросов и нужен не каждому клиенту.
+
+def month_bounds(n):
+    """n полных месяцев плюс текущий по вчерашний день, старые первыми. Текущий
+    помечен неполным: с полным месяцем его не сравнивают. Тринадцать полных —
+    чтобы последний полный месяц встретил себя же годом раньше."""
+    today = datetime.date.today()
+    y, m = today.year, today.month
+    out = []
+    if today.day > 1:
+        out.append((datetime.date(y, m, 1), today - datetime.timedelta(days=1), True))
+    for _ in range(n):
+        y, m = (y - 1, 12) if m == 1 else (y, m - 1)
+        first = datetime.date(y, m, 1)
+        nxt = datetime.date(y + (m == 12), 1 if m == 12 else m + 1, 1)
+        out.append((first, nxt - datetime.timedelta(days=1), False))
+    return list(reversed(out))
+
+
+def trend_metrika(token, counter, months):
+    """Визиты по источникам и электронная торговля помесячно.
+
+    Годовой интервал одним запросом Метрика не отдаёт: «Query is too
+    complicated» независимо от сэмплирования. Помесячно — отдаёт, и тот же
+    отказ здесь мигает так же, как в `stat()`: один прогон потребовал `low` на
+    2025 год, следующий прошёл весь с `full`. Поэтому лестница та же — повтор,
+    потом ниже — и у каждого месяца записано, какая точность сработала: цифра
+    с `low` — оценка по выборке, а не счёт."""
+    rows, notes = [], []
+    for first, last, partial in month_bounds(months):
+        row = {'month': first.strftime('%Y-%m'), 'partial': partial}
+        got = None
+        for acc, pause in (('full', 0), ('full', 4), ('medium', 2), ('low', 2)):
+            time.sleep(pause)
+            d, err = api(MET + '/stat/v1/data', token, {
+                'ids': counter, 'accuracy': acc, 'limit': 10,
+                'metrics': 'ym:s:visits,ym:s:ecommercePurchases,ym:s:ecommerceRevenue',
+                'dimensions': 'ym:s:lastsignTrafficSource',
+                'date1': first.isoformat(), 'date2': last.isoformat()})
+            if not err:
+                got, row['accuracy'] = d, acc
+                break
+            if 'too complicated' not in err:
+                notes.append('Метрика, %s: %s' % (row['month'], err[:120]))
+                break
+        if got is None:
+            rows.append(row)
+            continue
+        t = got.get('totals') or [0, 0, 0]
+        src = {r['dimensions'][0].get('name'): r['metrics'] for r in (got.get('data') or [])}
+        def pick(name, i):
+            return (src.get(name) or [0, 0, 0])[i]
+        row.update(visits=t[0], purchases=t[1], revenue=t[2],
+                   search=pick('Search engine traffic', 0),
+                   direct=pick('Direct traffic', 0),
+                   social=pick('Social network traffic', 0),
+                   search_revenue=pick('Search engine traffic', 2))
+        rows.append(row)
+        time.sleep(1)
+    return rows, notes
+
+
+def trend_webmaster(token, uid, hid, months):
+    """Показы и клики из Яндекса по дням, свёрнутые в месяцы. Дни без данных
+    (API отстаёт примерно на месяц и отдаёт по ним нули) отброшены, последняя
+    живая дата записана: без неё хвост выглядит обвалом трафика."""
+    bounds = month_bounds(months)
+    d, err = api('%s/user/%s/hosts/%s/search-queries/all/history/' % (WM, uid, hid), token, [
+        ('query_indicator', 'TOTAL_SHOWS'), ('query_indicator', 'TOTAL_CLICKS'),
+        ('date_from', bounds[0][0].isoformat()), ('date_to', bounds[-1][1].isoformat())])
+    if err:
+        return [], '', ['Вебмастер, история запросов: %s' % err[:160]]
+    ind = d.get('indicators') or {}
+    shows = {x.get('date', '')[:10]: x.get('value') or 0 for x in ind.get('TOTAL_SHOWS') or []}
+    clicks = {x.get('date', '')[:10]: x.get('value') or 0 for x in ind.get('TOTAL_CLICKS') or []}
+    live = sorted(k for k, v in shows.items() if v)
+    last = live[-1] if live else ''
+    rows = []
+    for first, _, _ in bounds:
+        key = first.strftime('%Y-%m')
+        days = [k for k in live if k.startswith(key)]
+        if not days:
+            continue
+        sh = sum(shows[k] for k in days)
+        cl = sum(clicks.get(k, 0) for k in days)
+        rows.append({'month': key, 'days': len(days), 'shows_per_day': round(sh / len(days)),
+                     'clicks_per_day': round(cl / len(days)),
+                     'ctr': round(100.0 * cl / sh, 1) if sh else None})
+    return rows, last, []
+
+
+def trend(token, m, w, months):
+    out = {'months': months, 'notes': []}
+    if m.get('counter'):
+        rows, notes = trend_metrika(token, m['counter'], months)
+        out['metrika'] = rows
+        out['notes'] += notes
+    if w.get('uid') and w.get('host_id'):
+        rows, last, notes = trend_webmaster(token, w['uid'], w['host_id'], months)
+        out['webmaster'] = rows
+        out['webmaster_last_date'] = last
+        out['notes'] += notes
+    out['ok'] = bool(out.get('metrika') or out.get('webmaster'))
+    return out
+
+
+def trend_brief(tr):
+    """Год к году в одну строку на источник. Сравниваются только полные месяцы;
+    если год назад того же месяца нет — первый из ряда, и об этом сказано."""
+    t = []
+    rows = [r for r in (tr.get('metrika') or []) if r.get('visits') is not None and not r['partial']]
+    if len(rows) >= 2:
+        b, a = rows[-1], rows[0]
+        for r in rows:
+            if r['month'][5:] == b['month'][5:] and r['month'] != b['month']:
+                a = r
+        how = 'год к году' if a['month'][5:] == b['month'][5:] else 'от первого месяца ряда'
+        t.append('Метрика по месяцам, %s (%s → %s): визиты %d → %d, из поиска %d → %d, '
+                 'прямые %d → %d, соцсети %d → %d.' % (
+                     how, a['month'], b['month'], a['visits'], b['visits'], a['search'],
+                     b['search'], a['direct'], b['direct'], a['social'], b['social']))
+        rev = [r for r in rows if r.get('revenue')]
+        if rev:
+            t.append('Электронная торговля в Метрике есть с %s: последний полный месяц %s — '
+                     '%d заказов, %.0f ₽, из них из поиска %.0f ₽.' % (
+                         rev[0]['month'], rev[-1]['month'], rev[-1]['purchases'],
+                         rev[-1]['revenue'], rev[-1]['search_revenue']))
+        low = [r['month'] for r in rows if r.get('accuracy') == 'low']
+        if low:
+            t.append('Месяцы %s посчитаны по выборке (accuracy=low): порядок верный, рубль — нет.'
+                     % ', '.join(low))
+    wr = tr.get('webmaster') or []
+    if len(wr) >= 2:
+        b, a = wr[-1], wr[0]
+        for r in wr:
+            if r['month'][5:] == b['month'][5:] and r['month'] != b['month']:
+                a = r
+        t.append('Яндекс по Вебмастеру (%s → %s): показов в день %d → %d, кликов в день %d → %d, '
+                 'CTR %s%% → %s%%; данные до %s.' % (
+                     a['month'], b['month'], a['shows_per_day'], b['shows_per_day'],
+                     a['clicks_per_day'], b['clicks_per_day'], a['ctr'], b['ctr'],
+                     tr.get('webmaster_last_date') or '?'))
+    for n in tr.get('notes') or []:
+        t.append('Не выгрузилось: ' + (n if len(n) < 120 else n[:117].rstrip() + '…'))
+    return '\n'.join(t)
 
 
 # ───────────────────────────────── Сводка ─────────────────────────────────
@@ -414,6 +568,9 @@ def main():
     ap.add_argument('--token-file', default='~/.config/ritmo/yandex.token')
     ap.add_argument('--days', type=int, default=90)
     ap.add_argument('--probe', action='store_true', help='писать в notes каждую неудачу, не только важные')
+    ap.add_argument('--trend', nargs='?', const=13, default=0, type=int, metavar='МЕСЯЦЕВ',
+                    help='помесячный ряд за N полных месяцев плюс текущий (без числа — 13): визиты по источникам и '
+                         'электронная торговля из Метрики, показы и клики из Вебмастера')
     a = ap.parse_args()
 
     token = os.environ.get('YANDEX_TOKEN', '')
@@ -432,11 +589,19 @@ def main():
     print('  Вебмастер: %s' % ('хост найден' if w.get('ok') else 'нет данных'))
 
     text = brief(m, w, host, a.days)
+    tr = {}
+    if a.trend:
+        tr = safe(trend, 'Годовой срез', token, m, w, a.trend)
+        print('  Срез за %d мес.: %s' % (a.trend, 'есть' if tr.get('ok') else 'нет данных'))
+        if tr.get('ok'):
+            text += '\n' + trend_brief(tr)
     tag = host.replace('.', '-')
     out = pathlib.Path(a.out) / tag
     out.mkdir(parents=True, exist_ok=True)
     data = {'host': host, 'when': datetime.datetime.now().strftime('%Y-%m-%d-%H%M'),
             'days': a.days, 'summary': text, 'metrika': m, 'webmaster': w}
+    if tr:
+        data['trend'] = tr
     (out / 'yandex.json').write_text(json.dumps(data, ensure_ascii=False, indent=1),
                                      encoding='utf-8')
     print('\n' + text)
