@@ -88,13 +88,32 @@ def read_token(path):
 # ───────────────────────────────── Метрика ─────────────────────────────────
 
 def stat(token, counter, metrics, dimensions='', days=30, limit=20, sort=''):
-    p = {'ids': counter, 'metrics': metrics, 'accuracy': 'full', 'limit': limit,
+    """Отчёт за последние `days` дней.
+
+    «Query is too complicated» у Метрики — не про размер запроса: 11 ноября
+    2026 на spbshield.ru один и тот же запрос за 90 дней проходил и через
+    секунду не проходил, с любой точностью, а помесячный ряд за год прошёл
+    целиком с full. Это мигающий отказ на их стороне. Поэтому сначала повтор
+    той же точности с паузой, и только потом ниже: medium, затем low.
+    Сработавшая точность пишется в ответ полем `_accuracy`: low — оценка по
+    выборке, не счёт."""
+    p = {'ids': counter, 'metrics': metrics, 'limit': limit,
          'date1': '%ddaysAgo' % days, 'date2': 'today'}
     if dimensions:
         p['dimensions'] = dimensions
     if sort:
         p['sort'] = sort
-    return api(MET + '/stat/v1/data', token, p)
+    err = ''
+    for acc, pause in (('full', 0), ('full', 4), ('medium', 2), ('low', 2)):
+        time.sleep(pause)
+        p['accuracy'] = acc
+        d, err = api(MET + '/stat/v1/data', token, p)
+        if not err:
+            d['_accuracy'] = acc
+            return d, ''
+        if 'too complicated' not in err:
+            break
+    return None, err
 
 
 def first_working(token, counter, candidates, as_dim=False, days=30):
@@ -194,6 +213,10 @@ def metrika(token, host, days, probe):
     else:
         t = (d.get('totals') or [None] * 4)
         out.update(visits=t[0], users=t[1], bounce=t[2], duration=t[3], days=days)
+        if d.get('_accuracy') != 'full':
+            out['accuracy'] = d['_accuracy']
+            out['notes'].append('Метрика: сводка посчитана с accuracy=%s — Яндекс не отдал '
+                                'полный счёт; порядок верный, единицы — нет.' % d['_accuracy'])
 
     dim, d, tried = first_working(token, counter, SOURCE_DIM, as_dim=True, days=days)
     if dim:
