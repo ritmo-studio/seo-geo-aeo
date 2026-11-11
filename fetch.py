@@ -10,7 +10,7 @@
 - тела больше MAX_BYTES не читаем, аудит смотрит разметку, а не медиа.
 """
 import gzip, hashlib, io, json, pathlib, re, ssl, time, zlib
-import urllib.error, urllib.parse, urllib.request, urllib.robotparser
+import urllib.error, urllib.parse, urllib.request
 
 UA = 'RitmoAudit/1.0 (+https://ritmo.studio/; SEO/AEO/GEO self-audit; 1 req/s)'
 MAX_BYTES = 3 * 1024 * 1024
@@ -53,6 +53,92 @@ class _Redirects(urllib.request.HTTPRedirectHandler):
         return urllib.request.HTTPRedirectHandler.redirect_request(self, req, fp, code, msg, headers, newurl)
 
 
+class Robots:
+    """Разбор robots.txt своими руками, а не стандартной библиотекой.
+
+    `urllib.robotparser` берёт у правила только path и выбрасывает query:
+    `Disallow: /?` превращается у него в `Disallow: /`, то есть закрывает сайт
+    целиком. Эта строка стоит в типовом robots.txt WordPress — на spbshield.ru
+    из-за неё обход по ссылкам остановился на первой же странице, и мы приняли
+    это за поломку сайта. Та же библиотека не понимает `*` и `$` внутри пути,
+    поэтому `Disallow: *?s=` у неё не срабатывает вообще: мы одновременно
+    закрывали лишнее и ходили по запрещённому.
+
+    Поддерживается то, что поддерживают Яндекс и Google: группы по User-agent,
+    `*` как любая последовательность, `$` как конец адреса, самое длинное
+    правило выигрывает, при равной длине выигрывает Allow. Сравнение идёт по
+    пути вместе с query — иначе `*?s=` снова станет бессмысленным.
+    """
+
+    def __init__(self, text=''):
+        self.groups = {}        # агент -> {'rules': [(rx, длина, allow)], 'delay': float|None}
+        agents, seen_rule = [], False
+        for raw in (text or '').splitlines():
+            line = raw.split('#', 1)[0].strip()
+            if not line or ':' not in line:
+                continue
+            field, _, value = line.partition(':')
+            field, value = field.strip().lower(), value.strip()
+            if field == 'user-agent':
+                # новая группа начинается, только если до этого были правила
+                if seen_rule:
+                    agents, seen_rule = [], False
+                agents.append(value.lower())
+                self.groups.setdefault(value.lower(), {'rules': [], 'delay': None})
+            elif field in ('allow', 'disallow') and agents:
+                seen_rule = True
+                if not value:
+                    continue            # пустой Disallow — «можно всё», не правило
+                if not (value.startswith('/') or value.startswith('*')):
+                    continue            # не путь, а мусорная строка
+                rule = (self._rx(value), len(value), field == 'allow')
+                for a in agents:
+                    self.groups[a]['rules'].append(rule)
+            elif field == 'crawl-delay' and agents:
+                seen_rule = True
+                try:
+                    delay = float(value.replace(',', '.'))
+                except ValueError:
+                    continue
+                for a in agents:
+                    self.groups[a]['delay'] = delay
+
+    @staticmethod
+    def _rx(pattern):
+        anchored = pattern.endswith('$')
+        body = pattern[:-1] if anchored else pattern
+        rx = '.*'.join(re.escape(part) for part in body.split('*'))
+        return re.compile('^' + rx + ('$' if anchored else ''))
+
+    def _group(self, ua):
+        """Группа по самому длинному совпавшему имени агента, иначе звёздочка."""
+        low = (ua or '').lower()
+        best = None
+        for agent in self.groups:
+            if agent and agent != '*' and agent in low:
+                if best is None or len(agent) > len(best):
+                    best = agent
+        return self.groups.get(best or '*')
+
+    def can_fetch(self, ua, url):
+        g = self._group(ua)
+        if not g or not g['rules']:
+            return True
+        parts = urllib.parse.urlsplit(url)
+        target = parts.path or '/'
+        if parts.query:
+            target += '?' + parts.query
+        best = None                      # (длина правила, allow)
+        for rx, length, allow in g['rules']:
+            if rx.match(target) and (best is None or (length, allow) > best):
+                best = (length, allow)
+        return best[1] if best else True
+
+    def crawl_delay(self, ua):
+        g = self._group(ua)
+        return g['delay'] if g else None
+
+
 class Fetcher:
     def __init__(self, delay=1.0, timeout=15, budget=300, cache=0, cache_dir=None,
                  obey_robots=True, insecure=False, log=print):
@@ -63,7 +149,7 @@ class Fetcher:
         self.used = 0            # сколько сетевых запросов потрачено из бюджета
         self.blocked = 0         # сколько отказов подряд
         self._last = 0.0
-        self._rp = {}            # host -> (robotparser, текст robots.txt)
+        self._rp = {}            # host -> (Robots, текст robots.txt)
         self.ctx = ssl._create_unverified_context() if insecure else None
 
     # — бюджет и пауза —
@@ -92,15 +178,20 @@ class Fetcher:
         self._rp[host] = (None, '')          # заглушка, чтобы не уйти в рекурсию
         r = self.get(urllib.parse.urljoin(base, '/robots.txt'), kind='robots')
         txt = r.body if (r.ok and r.body) else ''
-        rp = urllib.robotparser.RobotFileParser()
-        rp.parse(txt.splitlines())
-        self._rp[host] = (rp, txt)
+        self._rp[host] = (Robots(txt), txt)
         return txt
 
     def allowed(self, url):
         if not self.obey_robots:
             return True
-        rp = self._rp.get(urllib.parse.urlsplit(url).netloc)
+        host = urllib.parse.urlsplit(url).netloc
+        if host not in self._rp:
+            # Хост мог появиться по редиректу (spbshield.ru → www.spbshield.ru):
+            # раньше для него robots.txt не читался вообще, и мы ходили по
+            # чужому хосту без спроса. Вежливость не должна зависеть от того,
+            # с какого адреса начали обход.
+            self.robots('https://%s/' % host)
+        rp = self._rp.get(host)
         if not rp or not rp[0]:
             return True
         try:
