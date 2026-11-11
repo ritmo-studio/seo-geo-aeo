@@ -18,6 +18,7 @@
 import argparse
 import datetime
 import json
+import re
 import os
 import pathlib
 import stat as statmod
@@ -135,13 +136,44 @@ def domains(counter):
 
 
 def find_counter(token, host):
+    """Счётчик по хосту: сначала точное совпадение, подстрока — в последнюю очередь.
+
+    Подстрока первой стоила дорого: у spbshield.ru два счётчика, боевой
+    `www.spbshield.ru` и тестовый `new.spbshield.ru`, и `host in s` выбирал тот,
+    что попался раньше. Выбрался тестовый — 12 тысяч визитов и 94% отказов
+    вместо 642 тысяч и 23%, то есть выгрузка соврала в пятьдесят раз и выглядела
+    при этом правдоподобно. Поддомен с `new`, `dev`, `test`, `stage`, `staging`
+    отодвигается в конец всегда: такой счётчик почти никогда не тот, который
+    спрашивали, а если других нет — о выборе сказано в notes.
+    """
     d, err = api(MET + '/management/v1/counters', token, {'per_page': 200})
     if err:
         return 0, err
     got = d.get('counters') or []
+    bare = host[4:] if host.startswith('www.') else host
+    exact, prefixed, loose = [], [], []
     for c in got:
-        if any(host in s for s in domains(c)):
-            return c.get('id'), ''
+        for s in domains(c):
+            s = s.strip().lower().rstrip('/')
+            s = s.split('://')[-1]
+            if s in (bare, 'www.' + bare):
+                exact.append(c)
+            elif s.endswith('.' + bare):
+                prefixed.append(c)
+            elif bare in s:
+                loose.append(c)
+    def junk(c):
+        return any(re.match(r'(new|dev|test|stage|staging|beta|old)\b', s.split('.')[0].lower())
+                   for s in domains(c))
+    order = sorted(exact, key=junk) + sorted(prefixed, key=junk) + sorted(loose, key=junk)
+    if order:
+        pick = order[0]
+        note = ''
+        if len(order) > 1:
+            other = ', '.join('%s (%s)' % (c.get('id'), (domains(c) or [''])[0]) for c in order[1:4])
+            note = 'счётчиков с таким доменом несколько, взят %s (%s); остальные: %s' % (
+                pick.get('id'), (domains(pick) or [''])[0], other)
+        return pick.get('id'), note
     names = ', '.join(sorted({s for c in got for s in domains(c)}))[:200]
     return 0, 'счётчик для %s не найден. Доступны: %s' % (host, names or 'ни одного')
 
