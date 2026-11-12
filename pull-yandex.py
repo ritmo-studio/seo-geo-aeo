@@ -77,13 +77,24 @@ def api(url, token, params=None, timeout=60):
 
 
 def read_token(path):
+    """Токен из файла. Строки с # — комментарий, не часть токена.
+
+    Комментарий живёт в самом файле, а не в отдельном README рядом: токенов
+    стало больше одного (студийный и клиентский), и подпись, лежащая отдельно
+    от секрета, разъезжается с ним через полгода. Первая строка, не начинающаяся
+    с #, и есть токен.
+    """
     p = pathlib.Path(path).expanduser()
     if not p.exists():
         return '', 'нет файла с токеном: %s' % p
     mode = statmod.S_IMODE(p.stat().st_mode)
     if mode & 0o077:
         print('  внимание: %s читают посторонние (права %o). chmod 600.' % (p, mode))
-    return p.read_text(encoding='utf-8').strip(), ''
+    for line in p.read_text(encoding='utf-8').splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            return line, ''
+    return '', 'в файле нет токена, только комментарии: %s' % p
 
 
 # ───────────────────────────────── Метрика ─────────────────────────────────
