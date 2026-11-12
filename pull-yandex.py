@@ -390,6 +390,11 @@ def trend_metrika(token, counter, months):
     потом ниже — и у каждого месяца записано, какая точность сработала: цифра
     с `low` — оценка по выборке, а не счёт."""
     rows, notes = [], []
+    # Электронной торговли у счётчика может не быть вовсе, и тогда Метрика
+    # отвечает 400 на весь запрос — из-за одной метрики терялся весь год.
+    # У Клиники 812 (69779764) так и вышло: «ecommerce is not enabled».
+    # Поэтому метрики не одни на всех, а сужаются после первого отказа.
+    metrics = 'ym:s:visits,ym:s:ecommercePurchases,ym:s:ecommerceRevenue'
     for first, last, partial in month_bounds(months):
         row = {'month': first.strftime('%Y-%m'), 'partial': partial}
         got = None
@@ -397,26 +402,46 @@ def trend_metrika(token, counter, months):
             time.sleep(pause)
             d, err = api(MET + '/stat/v1/data', token, {
                 'ids': counter, 'accuracy': acc, 'limit': 10,
-                'metrics': 'ym:s:visits,ym:s:ecommercePurchases,ym:s:ecommerceRevenue',
+                'metrics': metrics,
                 'dimensions': 'ym:s:lastsignTrafficSource',
                 'date1': first.isoformat(), 'date2': last.isoformat()})
             if not err:
                 got, row['accuracy'] = d, acc
                 break
+            if 'ecommerce is not enabled' in err and 'ecommerce' in metrics:
+                metrics = 'ym:s:visits'
+                notes.append('Метрика: электронной торговли у счётчика нет, '
+                             'ряд собран по визитам')
+                d, err = api(MET + '/stat/v1/data', token, {
+                    'ids': counter, 'accuracy': acc, 'limit': 10,
+                    'metrics': metrics,
+                    'dimensions': 'ym:s:lastsignTrafficSource',
+                    'date1': first.isoformat(), 'date2': last.isoformat()})
+                if not err:
+                    got, row['accuracy'] = d, acc
+                    break
             if 'too complicated' not in err:
                 notes.append('Метрика, %s: %s' % (row['month'], err[:120]))
                 break
         if got is None:
             rows.append(row)
             continue
-        t = got.get('totals') or [0, 0, 0]
+        # Список метрик мог сузиться до одних визитов, поэтому не t[1] и t[2]
+        # напрямую: у счётчика без электронной торговли их в ответе просто нет,
+        # и жёсткий индекс уронил бы разбор там, где данные есть.
+        t = got.get('totals') or []
         src = {r['dimensions'][0].get('name'): r['metrics'] for r in (got.get('data') or [])}
+        def at(seq, i):
+            return seq[i] if seq and len(seq) > i else None
         def pick(name, i):
-            return (src.get(name) or [0, 0, 0])[i]
-        row.update(visits=t[0], purchases=t[1], revenue=t[2],
-                   search=pick('Search engine traffic', 0),
-                   direct=pick('Direct traffic', 0),
-                   social=pick('Social network traffic', 0),
+            return at(src.get(name), i)
+        # Визиты по источнику — ноль, если источника в месяце не было: это
+        # настоящий ноль, и в сводке он печатается как число. Деньги остаются
+        # None: «нет электронной торговли» и «торговля на нуль рублей» — разное.
+        row.update(visits=at(t, 0), purchases=at(t, 1), revenue=at(t, 2),
+                   search=pick('Search engine traffic', 0) or 0,
+                   direct=pick('Direct traffic', 0) or 0,
+                   social=pick('Social network traffic', 0) or 0,
                    search_revenue=pick('Search engine traffic', 2))
         rows.append(row)
         time.sleep(1)
